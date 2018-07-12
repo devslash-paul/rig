@@ -8,7 +8,9 @@ extern crate termion;
 extern crate tui;
 
 use git2::build::CheckoutBuilder;
+use git2::FetchOptions;
 use git2::Reference;
+use git2::RemoteCallbacks;
 use git2::Repository;
 use git2::Tree;
 use itertools::Itertools;
@@ -19,27 +21,40 @@ use termion::event;
 use termion::input::TermRead;
 use tui::backend::MouseBackend;
 use tui::Terminal;
+use git2::Cred;
+use termion::event::Key;
 
+#[derive(PartialEq, Debug)]
 enum MoveDirection {
     UP,
     DOWN,
 }
 
+#[derive(PartialEq, Debug)]
 enum Message {
     MOVE {
         direction: MoveDirection
     },
+
+    // ACTIONS
     SHUTDOWN,
-    ENTER,
+    FETCH,
+    FETCH_FILLED {
+        refspec: usize
+    },
+
     CHECKOUT {
         selected: usize
     },
+
+    ENTER,
     PROGRESS {
         p: u16,
         path: String
     },
 }
 
+#[derive(PartialEq, Debug)]
 struct Envelope {
     s: Message
 }
@@ -88,19 +103,9 @@ fn main() {
     thread::spawn(move || {
         for c in io::stdin().keys() {
             let evt = c.unwrap();
-            match evt {
-                // Directions
-                event::Key::Char('j') | event::Key::Down => { let _ = tx.send(Envelope { s: Message::MOVE { direction: MoveDirection::DOWN } }); }
-                event::Key::Char('k') | event::Key::Up => { let _ = tx.send(Envelope { s: Message::MOVE { direction: MoveDirection::UP } }); }
-
-                // Actions
-                event::Key::Char('\n') => { let _ = tx.send(Envelope { s: Message::ENTER }); }
-                event::Key::Char('q') => {
-                    let _ = tx.send(Envelope { s: Message::SHUTDOWN });
-                    return;
-                }
-                _ => ()
-            };
+            if let Some(t) = handle_event(evt) {
+                let _ = tx.send(t);
+            }
         }
     });
     let (io_tx, io_rx) = mpsc::channel::<Envelope>();
@@ -120,6 +125,11 @@ fn main() {
                             });
                         })
                     }
+                    Envelope { s: Message::FETCH_FILLED { refspec } } => {
+                        let branches = get_local_branches(&repo);
+                        let gitref = branches.get(refspec).unwrap();
+                        fetch(&repo, &[gitref.as_str()]);
+                    }
                     _ => ()
                 }
             }
@@ -129,7 +139,7 @@ fn main() {
     // First Draw
     draw(&mut terminal, &branches, &app);
 
-    // Reactor thread
+    // ui thread
     while let Ok(t) = rx.recv() {
         match t {
             Envelope { s: Message::MOVE { direction: MoveDirection::DOWN } } => {
@@ -151,6 +161,9 @@ fn main() {
                     app.path = String::from("");
                 }
             }
+            Envelope { s: Message::FETCH } => {
+                let _ = io_tx.send(Envelope { s: Message::FETCH_FILLED { refspec: app.position } });
+            }
             Envelope { s: Message::SHUTDOWN } => {
                 terminal.clear().unwrap();
                 return;
@@ -159,6 +172,34 @@ fn main() {
         }
         draw(&mut terminal, &branches, &app);
     }
+}
+
+fn handle_event(evt: Key) -> Option<Envelope> {
+    match evt {
+        // Directions
+        event::Key::Char('j') | event::Key::Down => Some(Envelope { s: Message::MOVE { direction: MoveDirection::DOWN } }),
+        event::Key::Char('k') | event::Key::Up => Some(Envelope { s: Message::MOVE { direction: MoveDirection::UP } }),
+
+        // Actions
+        event::Key::Char('\n') => Some(Envelope { s: Message::ENTER }),
+        event::Key::Char('f') => Some(Envelope { s: Message::FETCH }),
+
+        event::Key::Char('q') => Some(Envelope { s: Message::SHUTDOWN }),
+        _ => None
+    }
+}
+
+fn fetch(repo: &Repository, refspecs: &[&str]) {
+    let mut remote = repo.find_remote("origin").expect("MUST HAVE A REMOTE CALLED ORIGIN");
+    let mut cbs = RemoteCallbacks::default();
+    cbs.credentials(|url, user, allowed| {
+        Ok(Cred::ssh_key_from_agent("pault").unwrap())
+    });
+
+    let mut fo = FetchOptions::default();
+    fo.remote_callbacks(cbs);
+
+    remote.fetch(refspecs, Some(&mut fo), None).unwrap();
 }
 
 fn get_local_branches(repo: &Repository) -> Vec<String> {
@@ -199,14 +240,16 @@ fn switch_to<F: Fn(String, u16) -> ()>(repo: &Repository, refs: &str, f: F) {
 
             let up = b as u16;
             let to = c as u16;
-            f(String::from(path), (((f32::from(up)) / f32::from(to)) * 100.0) as u16)
+            f(String::from(path), ((f32::from(up)) / f32::from(to) * 100.0) as u16)
         });
 
     let name = rev.name().unwrap();
 
     repo.checkout_tree(&tree.as_object(), Option::Some(&mut co)).unwrap();
     repo.set_head(name).unwrap();
-    f("DONE".to_string(), 100);
+    // This will force a 100 percent to be reported in the event that the progress function
+    // cannot (such as no progress to do)
+    f("".to_string(), 100);
 }
 
 fn draw(terminal: &mut Terminal<MouseBackend>, b: &[String], a: &App) {
@@ -220,4 +263,15 @@ fn draw(terminal: &mut Terminal<MouseBackend>, b: &[String], a: &App) {
     }
 
     let _ = terminal.draw();
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_enter_key() {
+        let result = handle_event(event::Key::Char('\n')).expect("Enter should create a command");
+        assert_eq!(Envelope { s: Message::ENTER }, result);
+    }
 }
